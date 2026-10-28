@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>韦根设备批量配置工具 POST并发版</title>
+<style>
+*{box-sizing:border-box;font-family:system-ui,sans-serif;}
+body{padding:16px;max-width:1200px;margin:0 auto;background:#f5f7fa;}
+.card{background:#fff;padding:16px;border-radius:10px;margin-bottom:12px;box-shadow:0 1px 4px #00000018;}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px;}
+input{padding:8px 10px;border:1px solid #ccc;border-radius:6px;}
+input.ipseg{width:220px;}
+input.pass{width:240px;}
+input.wgtype{width:100px;}
+input.concurrency{width:80px;}
+button{padding:9px 16px;border:none;border-radius:6px;background:#2b7de9;color:#fff;cursor:pointer;font-weight:500;}
+button:disabled{background:#aaa;cursor:not-allowed;}
+#devList{width:100%;min-height:200px;border:1px solid #ddd;padding:10px;border-radius:6px;margin:8px 0;white-space:pre-line;font-family:monospace;font-size:13px;}
+#log{width:100%;height:180px;border:1px solid #ddd;padding:10px;border-radius:6px;margin-top:8px;overflow-y:auto;font-family:monospace;font-size:12px;background:#111;color:#0f0;}
+.label{min-width:90px;}
+</style>
+</head>
+<body>
+<div class="card">
+    <div class="row">
+        <span class="label">IP段：</span>
+        <input class="ipseg" id="ipSeg" placeholder="例如 192.168.0" value="192.168.0">
+        <span class="label">设备密码：</span>
+        <input class="pass" id="devPass" placeholder="admin1234" value="admin1234"></div>
+    <div class="row">
+        <span class="label">韦根类型：</span>
+        <input class="wgtype" id="wgType" value="3">
+        <span class="label">并发数：</span>
+        <input class="concurrency" id="concurrency" value="8">
+    </div>
+    <div class="row">
+        <button id="btnScan">搜索设备</button>
+        <button id="btnSetTime">设置时间</button>
+        <button id="btnSetWiegand">设置韦根</button>
+    </div>
+    <div>设备列表（IP | data）：</div>
+    <div id="devList"></div>
+    <div class="card" style="margin-top:12px;">
+    <div style="font-weight:bold;margin-bottom:8px;">韦根类型说明：
+    1 ： 不输出；
+    2  ：韦根26；
+    3  ：韦根34（默认）
+</div>
+    <div>运行日志：</div>
+    <div id="log"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const ipSegInput = $('#ipSeg');
+const passInput = $('#devPass');
+const wgTypeInput = $('#wgType');
+const concurrencyInput = $('#concurrency');
+const devListBox = $('#devList');
+const logBox = $('#log');
+const btnScan = $('#btnScan');
+const btnSetTime = $('#btnSetTime');
+const btnSetWiegand = $('#btnSetWiegand');
+
+let devList = [];
+let scanning = false;
+let runningTask = false;
+
+function log(txt){
+    const t = new Date().toLocaleTimeString();
+    logBox.innerText += `[${t}] ${txt}\n`;
+    logBox.scrollTop = logBox.scrollHeight;
+}
+function clearDevList(){
+    devList = [];
+    devListBox.innerText = "";
+}
+function refreshDevUI(){
+    let str = "";
+    devList.forEach(d=>{
+        str += `${d.ip} | ${d.data}\n`;
+    })
+    devListBox.innerText = str;
+}
+
+// 通用并发队列函数
+async function poolTask(tasks, limit) {
+    const results = [];
+    const executing = new Set();
+    for (const task of tasks) {
+        const p = Promise.resolve().then(task);
+        results.push(p);
+        executing.add(p);
+        p.finally(() => executing.delete(p));
+        if (executing.size >= limit) {
+            await Promise.race(executing);
+        }
+    }
+    return Promise.all(results);
+}
+
+// POST getDeviceKey
+async function fetchDeviceKey(ip){
+    const url = `http://${ip}:8090/getDeviceKey`;
+    try{
+        const res = await fetch(url, {
+            method:"POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: "", // 该接口无参数，空表单
+            signal: AbortSignal.timeout(1800)
+        });
+        if(!res.ok) return {ip, ok:false};
+        const json = await res.json();
+        if(json.data !== undefined){
+            return {ip, ok:true, data:json.data};
+        }
+        return {ip, ok:false};
+    }catch(e){
+        return {ip, ok:false};
+    }
+}
+
+// 扫描IP段 2~254
+async function scanIpRange(){
+    if(scanning) return;
+    const seg = ipSegInput.value.trim();
+    if(!/^\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(seg)){
+        alert("IP段格式错误！示例：192.168.100");
+        return;
+    }
+    const limit = parseInt(concurrencyInput.value) || 8;
+    if(limit <1 || limit>30){
+        alert("并发数范围1~30");
+        return;
+    }
+    clearDevList();
+    scanning = true;
+    btnScan.disabled = true;
+    log(`===== 开始扫描 ${seg}.2 ~ ${seg}.254，并发：${limit} =====`);
+
+    const tasks = [];
+    for(let i=2;i<=254;i++){
+        const ip = `${seg}.${i}`;
+        tasks.push(async ()=>{
+            log(`扫描：${ip}`);
+            const ret = await fetchDeviceKey(ip);
+            if(ret.ok){
+                log(`✅ 发现设备 ${ip} data=${ret.data}`);
+                devList.push({ip:ret.ip, data:ret.data});
+                refreshDevUI();
+            }
+            return ret;
+        })
+    }
+    await poolTask(tasks, limit);
+
+    log("===== 扫描完成，共找到："+devList.length+" 台 =====");
+    scanning = false;
+    btnScan.disabled = false;
+}
+
+// POST setTime
+async function setOneTime(ip, pass, ts){
+    const url = `http://${ip}:8090/setTime`;
+    const body = new URLSearchParams({pass, timestamp: ts});
+    try{
+        const res = await fetch(url, {
+            method:"POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body,
+            signal:AbortSignal.timeout(3000)
+        });
+        const text = await res.text();
+        return {ip, ok:true, msg:text};
+    }catch(e){
+        return {ip, ok:false, msg:e.message};
+    }
+}
+
+// 批量设置时间
+async function batchSetTime(){
+    if(runningTask || devList.length === 0){
+        alert("没有设备或者任务正在运行！");
+        return;
+    }
+    const limit = parseInt(concurrencyInput.value) || 8;
+    if(limit <1 || limit>30){
+        alert("并发数范围1~30");
+        return;
+    }
+    runningTask = true;
+    btnSetTime.disabled = true;
+    const pass = passInput.value.trim();
+    const ts = Date.now().toString();
+    log(`===== 批量设置时间，timestamp=${ts}，并发：${limit} =====`);
+
+    const tasks = devList.map(dev=> async ()=>{
+        const r = await setOneTime(dev.ip, pass, ts);
+        if(r.ok){
+            log(`✅ ${dev.ip} 设置时间成功：${r.msg}`);
+        }else{
+            log(`❌ ${dev.ip} 设置时间失败：${r.msg}`);
+        }
+        return r;
+    })
+    await poolTask(tasks, limit);
+
+    log("===== 设置时间任务结束 =====");
+    runningTask = false;
+    btnSetTime.disabled = false;
+}
+
+// POST setConfig 设置韦根
+async function setOneWiegand(ip, pass, wgNum){
+    const cfgObj = {
+        recSucWiegandType: Number(wgNum),
+        recSucWiegandContent: "{idcardNum}"
+    };
+    const cfgStr = JSON.stringify(cfgObj);
+    const url = `http://${ip}:8090/setConfig`;
+    const body = new URLSearchParams({pass, config: cfgStr});
+    try{
+        const res = await fetch(url, {
+            method:"POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body,
+            signal:AbortSignal.timeout(3000)
+        });
+        const text = await res.text();
+        return {ip, ok:true, msg:text};
+    }catch(e){
+        return {ip, ok:false, msg:e.message};
+    }
+}
+
+// 批量设置韦根
+async function batchSetWiegand(){
+    if(runningTask || devList.length === 0){
+        alert("没有设备或者任务正在运行！");
+        return;
+    }
+    const wgVal = wgTypeInput.value.trim();
+    const allowList = [1,2,3,4,5,6,7];
+    if(!allowList.includes(Number(wgVal))){
+        alert("韦根类型只能是：1~7\n1不输出 2韦根26 3韦根34 4韦根50 5韦根66 6韦根24 7韦根32");
+        return;
+    }
+    const limit = parseInt(concurrencyInput.value) || 8;
+    if(limit <1 || limit>30){
+        alert("并发数范围1~30");
+        return;
+    }
+    runningTask = true;
+    btnSetWiegand.disabled = true;
+    const pass = passInput.value.trim();
+    log(`===== 批量设置韦根类型：${wgVal}，并发：${limit} =====`);
+
+    const tasks = devList.map(dev=> async ()=>{
+        const r = await setOneWiegand(dev.ip, pass, wgVal);
+        if(r.ok){
+            log(`✅ ${dev.ip} 设置韦根成功：${r.msg}`);
+        }else{
+            log(`❌ ${dev.ip} 设置韦根失败：${r.msg}`);
+        }
+        return r;
+    })
+    await poolTask(tasks, limit);
+
+    log("===== 设置韦根任务结束 =====");
+    runningTask = false;
+    btnSetWiegand.disabled = false;
+}
+
+btnScan.onclick = scanIpRange;
+btnSetTime.onclick = batchSetTime;
+btnSetWiegand.onclick = batchSetWiegand;
+</script>
+</body>
+</html>
